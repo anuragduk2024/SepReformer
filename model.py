@@ -1,95 +1,230 @@
-import tensorflow as tf 
-import numpy as np 
+import torch
+import torch.nn as nn
 import os
-import shutil
+import yaml
 from datetime import datetime
+import numpy as np
 
-class SVSRNN(tf.keras.Model):
-    def __init__(self, num_features, num_rnn_layer=4, num_hidden_units=[256, 256, 256], tensorboard_directory='graphs/svsrnn', clear_tensorboard=True):
+class SVSRNN(nn.Module):
+    def __init__(self, num_features, num_rnn_layer, num_hidden_units, config_path=None):
         super(SVSRNN, self).__init__()
         
-        assert len(num_hidden_units) == num_rnn_layer
-
         self.num_features = num_features
         self.num_rnn_layer = num_rnn_layer
-        self.num_hidden_units = num_hidden_units
-
-        self.gstep = tf.Variable(0, dtype=tf.int64, trainable=False, name='global_step')
+        self.num_spks = 2  # Fixed for vocals and background
         
-        self.rnn_layers = [tf.keras.layers.GRU(units, return_sequences=True) for units in self.num_hidden_units]
-        self.dense_src1 = tf.keras.layers.Dense(self.num_features, activation='relu', name='y_hat_src1')
-        self.dense_src2 = tf.keras.layers.Dense(self.num_features, activation='relu', name='y_hat_src2')
-
-        self.gamma = 0.001
-        self.optimizer = tf.keras.optimizers.Adam()
-
-        if clear_tensorboard:
-            shutil.rmtree(tensorboard_directory, ignore_errors=True)
-        self.writer = tf.summary.create_file_writer(tensorboard_directory)
+        # Calculate padding for Conv1d to achieve 'same' padding effect
+        encoder_padding = (16 - 1) // 2  # For kernel_size=16
         
-    def call(self, inputs, training=False):
-        x = inputs
-        for rnn_layer in self.rnn_layers:
-            x = rnn_layer(x)
-        y_hat_src1 = self.dense_src1(x)
-        y_hat_src2 = self.dense_src2(x)
+        # Audio Encoder
+        self.audio_encoder = nn.Conv1d(
+            in_channels=num_features,
+            out_channels=num_features,
+            kernel_size=16,
+            stride=8,
+            padding=encoder_padding,
+            bias=True
+        )
         
-        mask_logits = tf.stack([y_hat_src1, y_hat_src2], axis=-1)
-        mask = tf.nn.softmax(mask_logits, axis=-1)
+        # Feature Projector
+        self.feature_projector = nn.Conv1d(
+            in_channels=num_features,
+            out_channels=num_hidden_units[0],
+            kernel_size=3,
+            padding=1,
+            bias=True
+        )
+        
+        # RNN Separator
+        self.rnn_layers = nn.ModuleList([
+            nn.GRU(
+                input_size=num_hidden_units[i-1] if i > 0 else num_hidden_units[0],
+                hidden_size=num_hidden_units[i],
+                batch_first=True
+            )
+            for i in range(num_rnn_layer)
+        ])
+        self.layer_norms = nn.ModuleList([nn.LayerNorm(num_hidden_units[i]) for i in range(num_rnn_layer)])
+        
+        # Output Layers
+        self.output_layers = nn.ModuleList([
+            nn.Conv1d(
+                in_channels=num_hidden_units[-1],
+                out_channels=num_features,
+                kernel_size=1,
+                padding=0,
+            )
+            for _ in range(self.num_spks)
+        ])
+        
+        # Audio Decoder
+        self.audio_decoder = nn.ConvTranspose1d(
+            in_channels=num_features,
+            out_channels=1,
+            kernel_size=16,
+            stride=8,
+            padding=4,
+            bias=True
+        )
+        
+        # Optimizer
+        self.optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=0.0001,
+            weight_decay=0.01
+        )
+        
+    def forward(self, x):
+        """Forward pass through the network"""
+        # Convert input to torch tensor if it's not already
+        if isinstance(x, np.ndarray):
+            x = torch.from_numpy(x).float()
+        
+        # Ensure input is float
+        x = x.float()
+        
+        # Input shape should be [batch, time, features]
+        # Convert to [batch, features, time] for Conv1d
+        if x.dim() == 3 and x.size(2) == self.num_features:
+            x = x.transpose(1, 2)
+        
+        # Move to the same device as the model
+        x = x.to(next(self.parameters()).device)
+        
+        # Audio Encoding
+        encoded = self.audio_encoder(x)  # [batch, features, time]
+        
+        # Feature Projection
+        features = self.feature_projector(encoded)  # [batch, hidden, time]
+        
+        # RNN Processing
+        x = features.transpose(1, 2)  # [batch, time, hidden]
+        for rnn_layer, norm_layer in zip(self.rnn_layers, self.layer_norms):
+            x, _ = rnn_layer(x)
+            x = norm_layer(x)
+        x = x.transpose(1, 2)  # [batch, hidden, time]
+        
+        # Mask Estimation
+        masks = []
+        for output_layer in self.output_layers:
+            mask = torch.relu(output_layer(x))  # [batch, features, time]
+            masks.append(mask)
+        
+        # Stack masks along new dimension
+        mask_stack = torch.stack(masks, dim=1)  # [batch, num_spks, features, time]
+        
+        # Softmax across speakers (dim=1)
+        mask_stack = torch.softmax(mask_stack, dim=1)
+        
+        # Apply masks and decode
+        separated = []
+        for i in range(self.num_spks):
+            # Get mask for current speaker
+            mask = mask_stack[:, i]  # [batch, features, time]
+            
+            # Apply mask to encoded features
+            masked = mask * encoded  # [batch, features, time]
+            
+            # Decode to waveform
+            decoded = self.audio_decoder(masked)  # [batch, 1, time]
+            separated.append(decoded)
+        
+        return separated
     
-        y_tilde_src1 = mask[..., 0] * inputs
-        y_tilde_src2 = mask[..., 1] * inputs
+    def sisnr(self, estimate, target, eps=1e-8):
+        """Scale-invariant SNR loss"""
+        # Normalize
+        target = target - torch.mean(target, dim=-1, keepdim=True)
+        estimate = estimate - torch.mean(estimate, dim=-1, keepdim=True)
         
-        return y_tilde_src1, y_tilde_src2
-
-    def loss_fn(self, y_src1, y_src2, y_pred_src1, y_pred_src2):
-        return tf.reduce_mean(tf.square(y_src1 - y_pred_src1) + tf.square(y_src2 - y_pred_src2))
-
-    @tf.function
-    def train_step(self, x, y1, y2):
-        with tf.GradientTape() as tape:
-            y_pred_src1, y_pred_src2 = self(x, training=True)
-            loss = self.loss_fn(y1, y2, y_pred_src1, y_pred_src2)
-        gradients = tape.gradient(loss, self.trainable_variables)
-        self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
-        return loss, y_pred_src1, y_pred_src2
-
-    def train(self, x, y1, y2, learning_rate):
-        self.optimizer.learning_rate = learning_rate
-        loss, y_pred_src1, y_pred_src2 = self.train_step(x, y1, y2)
+        # Compute SNR
+        target_energy = torch.sum(target ** 2, dim=-1, keepdim=True) + eps
+        dot = torch.sum(target * estimate, dim=-1, keepdim=True)
+        proj = dot * target / target_energy
+        noise = estimate - proj
         
-        self.summary(x, y1, y2, y_pred_src1, y_pred_src2, loss)
+        ratio = (torch.sum(proj ** 2, dim=-1) + eps) / (torch.sum(noise ** 2, dim=-1) + eps)
+        snr = 10 * torch.log10(ratio)
         
-        return loss.numpy()
-
-    @tf.function
-    def validate(self, x, y1, y2):
-        y1_pred, y2_pred = self(x, training=False)
-        validate_loss = self.loss_fn(y1, y2, y1_pred, y2_pred)
-        return y1_pred, y2_pred, validate_loss
-
-    def test(self, x):
-        return self(x, training=False)
-
-    def save(self, directory, filename):
-        if not os.path.exists(directory):
-            os.makedirs(directory)
-        if not filename.endswith('.weights.h5'):
-            filename = filename.rsplit('.', 1)[0] + '.weights.h5'
-        self.save_weights(os.path.join(directory, filename))
-        return os.path.join(directory, filename)
+        return torch.mean(snr)
+    
+    def loss_fn(self, estimates, targets):
+        """Calculate loss"""
+        losses = []
+        for est, target in zip(estimates, targets):
+            losses.append(-self.sisnr(est, target))
+        return torch.mean(torch.stack(losses))
+    
+    def train_step(self, x, y):
+        """Single training step"""
+        self.train()
+        self.optimizer.zero_grad()
+        
+        estimates = self(x)
+        loss = self.loss_fn(estimates, y)
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.parameters(), 5.0)  # Fixed clip norm
+        
+        self.optimizer.step()
+        return loss.item()
+    
+    def validate(self, x, y):
+        """Validation step"""
+        self.eval()
+        with torch.no_grad():
+            estimates = self(x)
+            loss = self.loss_fn(estimates, y)
+        return loss.item()
+    
+    def save_checkpoint(self, path, epoch, is_best=False):
+        """Save model checkpoint"""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+        }
+        torch.save(checkpoint, f"{path}.pt")
+        if is_best:
+            best_path = os.path.join(os.path.dirname(path), 'best_model.pt')
+            torch.save(checkpoint, best_path)
+    
+    def load_checkpoint(self, path):
+        """Load model checkpoint"""
+        checkpoint = torch.load(path)
+        self.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        return checkpoint['epoch']
 
     def load(self, filepath):
-        self.load_weights(filepath)
-
-    def summary(self, x, y1, y2, y_pred_src1, y_pred_src2, loss):
-        with self.writer.as_default():
-            tf.summary.scalar('loss', loss, step=self.gstep)
-            tf.summary.histogram('x_mixed', x, step=self.gstep)
-            tf.summary.histogram('y_src1', y1, step=self.gstep)
-            tf.summary.histogram('y_src2', y2, step=self.gstep)
-            tf.summary.histogram('y_pred_src1', y_pred_src1, step=self.gstep)
-            tf.summary.histogram('y_pred_src2', y_pred_src2, step=self.gstep)
-            self.writer.flush()
-        
-        self.gstep.assign_add(1)
+        """Load model weights from a file"""
+        if filepath.endswith('.h5'):  # TensorFlow weights
+            print("Warning: TensorFlow weights detected. Please convert weights to PyTorch format first.")
+            return
+            
+        if not os.path.exists(filepath):
+            print(f"Warning: Model file {filepath} not found.")
+            return
+            
+        try:
+            checkpoint = torch.load(filepath, map_location=next(self.parameters()).device)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                # Loading from our own checkpoint format
+                self.load_state_dict(checkpoint['model_state_dict'])
+                if 'optimizer_state_dict' in checkpoint:
+                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            else:
+                # Direct state dict
+                self.load_state_dict(checkpoint)
+            print(f"Successfully loaded model from {filepath}")
+        except Exception as e:
+            print(f"Error loading model: {str(e)}")
+            
+    def test(self, x):
+        """Run inference on input data"""
+        self.eval()
+        with torch.no_grad():
+            separated = self(x)
+            # Convert to numpy arrays
+            return [s.cpu().numpy() for s in separated]
