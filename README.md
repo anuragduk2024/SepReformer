@@ -14,10 +14,6 @@ $ python train.py
     <img src = "./figures/training_loss.png" width="75%">
 </p>
 
-<p align="center">
-    <img src = "./figures/training_validation_loss.png" width="75%">
-</p>
-
 ## Example
 The pretrained model was then used on 'Bye Bye Bye' song, which is placed in the ``songs`` directory.The separated sources, together with the monaural source, were saved to the ``main-demo`` directory.
 The seperated sources are not perfect as the dataset is not large enough and the model should be experimented with more layers.
